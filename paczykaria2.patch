@@ -22,6 +22,74 @@
    }
    if (stat.sessionUploadLength > 0) {
      o << " UL:" << colors::cyan << sizeFormatter(stat.uploadSpeed) << "B"
+@@ -210,11 +211,12 @@
+   size_t cols_;
+   const DownloadEngine* e_;
+   const SizeFormatter& sizeFormatter_;
++  const bool color_;
+ 
+ public:
+   PrintSummary(size_t cols, const DownloadEngine* e,
+-               const SizeFormatter& sizeFormatter)
+-      : cols_(cols), e_(e), sizeFormatter_(sizeFormatter)
++               const SizeFormatter& sizeFormatter, const bool color)
++      : cols_(cols), e_(e), sizeFormatter_(sizeFormatter), color_(color)
+   {
+   }
+ 
+@@ -229,7 +231,7 @@
+     writeFilePath(fileEntries.begin(), fileEntries.end(), o,
+                   rg->inMemoryDownload());
+     o << "\n" << std::setfill(SEP_CHAR) << std::setw(cols_) << SEP_CHAR << "\n";
+-    auto str = o.str(false);
++    auto str = o.str(color_);
+     global::cout()->write(str.c_str());
+   }
+ };
+@@ -238,7 +240,8 @@
+ namespace {
+ void printProgressSummary(const RequestGroupList& groups, size_t cols,
+                           const DownloadEngine* e,
+-                          const SizeFormatter& sizeFormatter)
++                          const SizeFormatter& sizeFormatter,
++                          const bool color)
+ {
+   const char SEP_CHAR = '=';
+   time_t now;
+@@ -263,7 +266,7 @@
+     << std::setfill(SEP_CHAR) << std::setw(cols) << SEP_CHAR << "\n";
+   global::cout()->write(o.str().c_str());
+   std::for_each(groups.begin(), groups.end(),
+-                PrintSummary(cols, e, sizeFormatter));
++                PrintSummary(cols, e, sizeFormatter, color));
+ }
+ } // namespace
+ 
+@@ -319,6 +322,7 @@
+     global::cout()->printf("\r%s\r", line.c_str());
+   }
+   ColorizedStream o;
++  const bool color = global::cout()->supportsColor() && isTTY_ && colorOutput_;
+   if (e->getRequestGroupMan()->countRequestGroup() > 0) {
+     if ((summaryInterval_ > 0_s) &&
+         lastSummaryNotified_.difference(global::wallclock()) +
+@@ -326,7 +330,7 @@
+             summaryInterval_) {
+       lastSummaryNotified_ = global::wallclock();
+       printProgressSummary(e->getRequestGroupMan()->getRequestGroups(), cols, e,
+-                           sizeFormatter);
++                           sizeFormatter, color);
+       global::cout()->write("\n");
+       global::cout()->flush();
+     }
+@@ -335,7 +339,6 @@
+     return;
+   }
+   size_t numGroup = e->getRequestGroupMan()->countRequestGroup();
+-  const bool color = global::cout()->supportsColor() && isTTY_ && colorOutput_;
+   if (numGroup == 1) {
+     const std::shared_ptr<RequestGroup>& rg =
+         *e->getRequestGroupMan()->getRequestGroups().begin();
 --- a/src/OptionHandlerFactory.cc
 +++ b/src/OptionHandlerFactory.cc
 @@ -440,7 +440,7 @@

@@ -1,0 +1,94 @@
+--- a/src/Context.cc
++++ b/src/Context.cc
+@@ -221,6 +221,12 @@ Context::Context(bool standalone, int argc, char** argv, const KeyVals& options)
+   if (op->getAsBool(PREF_DISABLE_IPV6)) {
+     SocketCore::setProtocolFamily(AF_INET);
+   }
++#ifdef _WIN32
++  if (op->getAsBool(PREF_DISABLE_SLEEP)) {
++    if (!SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED))
++		A2_LOG_WARN("--disable-sleep-until-finished: Failed to disable sleep mode.");
++  }
++#endif // _WIN32
+   SocketCore::setIpDscp(op->getAsInt(PREF_DSCP));
+   SocketCore::setSocketRecvBufferSize(
+       op->getAsInt(PREF_SOCKET_RECV_BUFFER_SIZE));
+@@ -313,6 +319,11 @@ Context::Context(bool standalone, int argc, char** argv, const KeyVals& options)
+     reqinfo = std::make_shared<MultiUrlRequestInfo>(std::move(requestGroups),
+                                                     op, uriListParser);
+   }
++#ifdef _WIN32
++  if (op->getAsBool(PREF_DISABLE_SLEEP)) {
++    SetThreadExecutionState(ES_CONTINUOUS);
++  }
++#endif // _WIN32
+ }
+ 
+ Context::~Context() = default;
+--- a/src/OptionHandlerFactory.cc
++++ b/src/OptionHandlerFactory.cc
+@@ -738,6 +738,14 @@ std::vector<OptionHandler*> OptionHandlerFactory::createOptionHandlers()
+     op->addTag(TAG_ADVANCED);
+     handlers.push_back(op);
+   }
++#if _WIN32
++  {
++    OptionHandler* op(new BooleanOptionHandler(
++        PREF_DISABLE_SLEEP, TEXT_DISABLE_SLEEP, A2_V_TRUE, OptionHandler::OPT_ARG));
++    op->addTag(TAG_ADVANCED);
++    handlers.push_back(op);
++  }
++#endif // _WIN32
+   {
+     OptionHandler* op(new BooleanOptionHandler(
+         PREF_RPC_ALLOW_ORIGIN_ALL, TEXT_RPC_ALLOW_ORIGIN_ALL, A2_V_FALSE,
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -38,6 +38,7 @@
+ 
+ #ifdef __MINGW32__
+ #  include <shellapi.h>
++#  include <winbase.h>
+ #endif // __MINGW32__
+ 
+ #include <aria2/aria2.h>
+--- a/src/prefs.cc
++++ b/src/prefs.cc
+@@ -334,6 +334,10 @@ PrefPtr PREF_SHOW_CONSOLE_READOUT = makePref("show-console-readout");
+ PrefPtr PREF_STREAM_PIECE_SELECTOR = makePref("stream-piece-selector");
+ // value: true | false
+ PrefPtr PREF_TRUNCATE_CONSOLE_READOUT = makePref("truncate-console-readout");
++#ifdef _WIN32
++// value: true | false
++PrefPtr PREF_DISABLE_SLEEP = makePref("disable-sleep-until-finished");
++#endif // _WIN32
+ // value: true | false
+ PrefPtr PREF_PAUSE = makePref("pause");
+ // value: default | full | hide
+--- a/src/prefs.h
++++ b/src/prefs.h
+@@ -287,6 +287,10 @@ extern PrefPtr PREF_SHOW_CONSOLE_READOUT;
+ extern PrefPtr PREF_STREAM_PIECE_SELECTOR;
+ // value: true | false
+ extern PrefPtr PREF_TRUNCATE_CONSOLE_READOUT;
++#ifdef _WIN32
++// value: true | false
++extern PrefPtr PREF_DISABLE_SLEEP;
++#endif // _WIN32
+ // value: true | false
+ extern PrefPtr PREF_PAUSE;
+ // value: default | full | hide
+--- a/src/usage_text.h
++++ b/src/usage_text.h
+@@ -884,6 +884,11 @@
+ #define TEXT_TRUNCATE_CONSOLE_READOUT                                   \
+   _(" --truncate-console-readout[=true|false] Truncate console readout to fit in\n"\
+     "                              a single line.")
++#ifdef _WIN32
++#define TEXT_DISABLE_SLEEP \
++  _(" --disable-sleep-until-finished[=true|false] Disables sleep mode on Windows\n" \
++    "                              until downloads are finished.")
++#endif // _WIN32
+ #define TEXT_PAUSE                              \
+   _(" --pause[=true|false]         Pause download after added. This option is\n" \
+     "                              effective only when --enable-rpc=true is given.")

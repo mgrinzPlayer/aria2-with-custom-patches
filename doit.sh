@@ -11,44 +11,37 @@ make -j$(nproc)
 make install
 cd ..
 
-tar -xf expat-2.5.0.tar.xz
-cd expat-2.5.0
+tar -xf expat-2.6.4.tar.xz
+cd expat-2.6.4
 ./configure --enable-shared=no --enable-static=yes --host=$HOST --prefix=$PREFIX --without-examples CFLAGS='-g0 -O3' CXXFLAGS='-g0 -O3'
 make -j$(nproc)
 make install
 cd ..
 
-tar -xf sqlite-autoconf-3440100.tar.gz
-cd sqlite-autoconf-3440100
+tar -xf sqlite-autoconf-3470000.tar.gz
+cd sqlite-autoconf-3470000
 ./configure --enable-shared=no --enable-static=yes --host=$HOST --prefix=$PREFIX CFLAGS='-g0 -O3'
 make -j$(nproc)
 make install
 cd ..
 
-tar -xf c-ares-1.22.1.tar.gz
-cd c-ares-1.22.1
-#speedup "configure" for mingw-w64
-patch -p1 < ../paczykcaresconf.patch
-#if above patch doesn't apply, use those below
-#export curl_cv_func_getnameinfo_args='const struct sockaddr *,socklen_t,DWORD,int'
-#export curl_cv_func_recv_args='SOCKET,char *,int,int,int'
-#export curl_cv_func_recvfrom_args='SOCKET,char *,int,int,struct sockaddr *,int *,int'
-#export curl_cv_func_send_args='SOCKET,const char *,int,int,int'
+tar -xf c-ares-1.34.3.tar.gz
+cd c-ares-1.34.3
 ./configure --enable-shared=no --enable-static=yes --host=$HOST --prefix=$PREFIX --without-random --disable-tests CFLAGS='-g0 -O3' CXXFLAGS='-g0 -O3'
 make -j$(nproc)
 make install
 cd ..
 
-tar -xf zlib-1.3.tar.xz
-cd zlib-1.3
+tar -xf zlib-1.3.1.tar.xz
+cd zlib-1.3.1
 export CHOST=$HOST
 ./configure --static --prefix=$PREFIX
 make -j$(nproc)
 make install
 cd ..
 
-tar -xf libssh2-1.11.0.tar.xz
-cd libssh2-1.11.0
+tar -xf libssh2-1.11.1.tar.xz
+cd libssh2-1.11.1
 ./configure --enable-shared=no --enable-static=yes --host=$HOST --prefix=$PREFIX --disable-examples-build CFLAGS='-g0 -O3' CXXFLAGS='-g0 -O3'
 make -j$(nproc)
 make install
@@ -58,6 +51,10 @@ mkdir -p binaries/$arch
 tar -xf aria2-1.37.0.tar.xz
 cd aria2-1.37.0
 patch -p1 < ../paczykaria2.patch
+patch -p1 < ../preventsystemsleepwindows.patch
+patch -p1 < ../retry_on_HTTP500.patch
+patch -p1 < ../fix.levenshtein.PR2226.patch
+patch -p1 < ../c-ares.handle.deprecated.functions.PR2225,2228.patch
 ./mingw-config
 make -j$(nproc)
 ${HOST}-strip src/aria2c.exe
@@ -65,12 +62,12 @@ cp src/aria2c.exe ../binaries/$arch/aria2c-$arch.exe
 cd ..
 
 rm -r aria2-1.37.0
-rm -r c-ares-1.22.1
-rm -r expat-2.5.0
+rm -r c-ares-1.34.3
+rm -r expat-2.6.4
 rm -r gmp-6.3.0
-rm -r libssh2-1.11.0
-rm -r sqlite-autoconf-3440100
-rm -r zlib-1.3
+rm -r libssh2-1.11.1
+rm -r sqlite-autoconf-3470000
+rm -r zlib-1.3.1
 
 arch=i686
 export HOST=$arch-w64-mingw32
@@ -83,44 +80,37 @@ make -j$(nproc)
 make install
 cd ..
 
-tar -xf expat-2.5.0.tar.xz
-cd expat-2.5.0
+tar -xf expat-2.6.4.tar.xz
+cd expat-2.6.4
 ./configure --enable-shared=no --enable-static=yes --host=$HOST --prefix=$PREFIX --without-examples CFLAGS='-g0 -O3' CXXFLAGS='-g0 -O3'
 make -j$(nproc)
 make install
 cd ..
 
-tar -xf sqlite-autoconf-3440100.tar.gz
-cd sqlite-autoconf-3440100
+tar -xf sqlite-autoconf-3470000.tar.gz
+cd sqlite-autoconf-3470000
 ./configure --enable-shared=no --enable-static=yes --host=$HOST --prefix=$PREFIX CFLAGS='-g0 -O3'
 make -j$(nproc)
 make install
 cd ..
 
-tar -xf c-ares-1.22.1.tar.gz
-cd c-ares-1.22.1
-#speedup "configure" for mingw-w64
-patch -p1 < ../paczykcaresconf.patch
-#if above patch doesn't apply, use those below
-#export curl_cv_func_getnameinfo_args='const struct sockaddr *,socklen_t,DWORD,int'
-#export curl_cv_func_recv_args='SOCKET,char *,int,int,int'
-#export curl_cv_func_recvfrom_args='SOCKET,char *,int,int,struct sockaddr *,int *,int'
-#export curl_cv_func_send_args='SOCKET,const char *,int,int,int'
+tar -xf c-ares-1.34.3.tar.gz
+cd c-ares-1.34.3
 ./configure --enable-shared=no --enable-static=yes --host=$HOST --prefix=$PREFIX --without-random --disable-tests CFLAGS='-g0 -O3' CXXFLAGS='-g0 -O3'
 make -j$(nproc)
 make install
 cd ..
 
-tar -xf zlib-1.3.tar.xz
-cd zlib-1.3
+tar -xf zlib-1.3.1.tar.xz
+cd zlib-1.3.1
 export CHOST=$HOST
 ./configure --static --prefix=$PREFIX
 make -j$(nproc)
 make install
 cd ..
 
-tar -xf libssh2-1.11.0.tar.xz
-cd libssh2-1.11.0
+tar -xf libssh2-1.11.1.tar.xz
+cd libssh2-1.11.1
 ./configure --enable-shared=no --enable-static=yes --host=$HOST --prefix=$PREFIX --disable-examples-build CFLAGS='-g0 -O3' CXXFLAGS='-g0 -O3'
 make -j$(nproc)
 make install
@@ -130,6 +120,10 @@ mkdir -p binaries/$arch
 tar -xf aria2-1.37.0.tar.xz
 cd aria2-1.37.0
 patch -p1 < ../paczykaria2.patch
+patch -p1 < ../preventsystemsleepwindows.patch
+patch -p1 < ../retry_on_HTTP500.patch
+patch -p1 < ../fix.levenshtein.PR2226.patch
+patch -p1 < ../c-ares.handle.deprecated.functions.PR2225,2228.patch
 ./mingw-config
 make -j$(nproc)
 ${HOST}-strip src/aria2c.exe

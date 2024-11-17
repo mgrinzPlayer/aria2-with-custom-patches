@@ -1,0 +1,587 @@
+--- a/src/AsyncNameResolver.cc
++++ b/src/AsyncNameResolver.cc
+@@ -40,10 +40,11 @@
+ #include "LogFactory.h"
+ #include "SocketCore.h"
+ #include "util.h"
++#include "EventPoll.h"
+ 
+ namespace aria2 {
+ 
+-void callback(void* arg, int status, int timeouts, struct hostent* host)
++void callback(void* arg, int status, int timeouts, ares_addrinfo* result)
+ {
+   AsyncNameResolver* resolverPtr = reinterpret_cast<AsyncNameResolver*>(arg);
+   if (status != ARES_SUCCESS) {
+@@ -51,12 +52,15 @@
+     resolverPtr->status_ = AsyncNameResolver::STATUS_ERROR;
+     return;
+   }
+-  for (char** ap = host->h_addr_list; *ap; ++ap) {
++  for (auto ap = result->nodes; ap; ap = ap->ai_next) {
+     char addrstring[NI_MAXHOST];
+-    if (inetNtop(host->h_addrtype, *ap, addrstring, sizeof(addrstring)) == 0) {
++    auto rv = getnameinfo(ap->ai_addr, ap->ai_addrlen, addrstring,
++                          sizeof(addrstring), nullptr, 0, NI_NUMERICHOST);
++    if (rv == 0) {
+       resolverPtr->resolvedAddresses_.push_back(addrstring);
+     }
+   }
++  ares_freeaddrinfo(result);
+   if (resolverPtr->resolvedAddresses_.empty()) {
+     resolverPtr->error_ = "no address returned or address conversion failed";
+     resolverPtr->status_ = AsyncNameResolver::STATUS_ERROR;
+@@ -66,24 +70,63 @@
+   }
+ }
+ 
+-AsyncNameResolver::AsyncNameResolver(int family
+-#ifdef HAVE_ARES_ADDR_NODE
+-                                     ,
+-                                     ares_addr_node* servers
+-#endif // HAVE_ARES_ADDR_NODE
+-                                     )
++namespace {
++void sock_state_cb(void* arg, ares_socket_t fd, int read, int write)
++{
++  auto resolver = static_cast<AsyncNameResolver*>(arg);
++
++  resolver->handle_sock_state(fd, read, write);
++}
++} // namespace
++
++void AsyncNameResolver::handle_sock_state(ares_socket_t fd, int read, int write)
++{
++  int events = 0;
++
++  if (read) {
++    events |= EventPoll::EVENT_READ;
++  }
++
++  if (write) {
++    events |= EventPoll::EVENT_WRITE;
++  }
++
++  auto it = std::find_if(
++      std::begin(socks_), std::end(socks_),
++      [fd](const AsyncNameResolverSocketEntry& ent) { return ent.fd == fd; });
++  if (it == std::end(socks_)) {
++    if (!events) {
++      return;
++    }
++
++    socks_.emplace_back(AsyncNameResolverSocketEntry{fd, events});
++
++    return;
++  }
++
++  if (!events) {
++    socks_.erase(it);
++    return;
++  }
++
++  (*it).events = events;
++}
++
++AsyncNameResolver::AsyncNameResolver(int family, const std::string& servers)
+     : status_(STATUS_READY), family_(family)
+ {
++  ares_options opts{};
++  opts.sock_state_cb = sock_state_cb;
++  opts.sock_state_cb_data = this;
++
+   // TODO evaluate return value
+-  ares_init(&channel_);
+-#if defined(HAVE_ARES_SET_SERVERS) && defined(HAVE_ARES_ADDR_NODE)
+-  if (servers) {
+-    // ares_set_servers has been added since c-ares 1.7.1
+-    if (ares_set_servers(channel_, servers) != ARES_SUCCESS) {
+-      A2_LOG_DEBUG("ares_set_servers failed");
++  ares_init_options(&channel_, &opts, ARES_OPT_SOCK_STATE_CB);
++
++  if (!servers.empty()) {
++    if (ares_set_servers_csv(channel_, servers.c_str()) != ARES_SUCCESS) {
++      A2_LOG_DEBUG("ares_set_servers_csv failed");
+     }
+   }
+-#endif // HAVE_ARES_SET_SERVERS && HAVE_ARES_ADDR_NODE
+ }
+ 
+ AsyncNameResolver::~AsyncNameResolver() { ares_destroy(channel_); }
+@@ -92,25 +135,58 @@
+ {
+   hostname_ = name;
+   status_ = STATUS_QUERYING;
+-  ares_gethostbyname(channel_, name.c_str(), family_, callback, this);
++
++  ares_addrinfo_hints hints{};
++  hints.ai_family = family_;
++
++  ares_getaddrinfo(channel_, name.c_str(), nullptr, &hints, callback, this);
+ }
+ 
+-int AsyncNameResolver::getFds(fd_set* rfdsPtr, fd_set* wfdsPtr) const
++ares_socket_t AsyncNameResolver::getFds(fd_set* rfdsPtr, fd_set* wfdsPtr) const
+ {
+-  return ares_fds(channel_, rfdsPtr, wfdsPtr);
++  ares_socket_t nfds = 0;
++
++  for (const auto& ent : socks_) {
++    if (ent.events & EventPoll::EVENT_READ) {
++      FD_SET(ent.fd, rfdsPtr);
++      nfds = std::max(nfds, ent.fd + 1);
++    }
++
++    if (ent.events & EventPoll::EVENT_WRITE) {
++      FD_SET(ent.fd, wfdsPtr);
++      nfds = std::max(nfds, ent.fd + 1);
++    }
++  }
++
++  return nfds;
+ }
+ 
+ void AsyncNameResolver::process(fd_set* rfdsPtr, fd_set* wfdsPtr)
+ {
+-  ares_process(channel_, rfdsPtr, wfdsPtr);
++  for (const auto& ent : socks_) {
++    ares_socket_t readfd = ARES_SOCKET_BAD;
++    ares_socket_t writefd = ARES_SOCKET_BAD;
++
++    if (FD_ISSET(ent.fd, rfdsPtr) && (ent.events & EventPoll::EVENT_READ)) {
++      readfd = ent.fd;
++    }
++
++    if (FD_ISSET(ent.fd, wfdsPtr) && (ent.events & EventPoll::EVENT_WRITE)) {
++      writefd = ent.fd;
++    }
++
++    if (readfd != ARES_SOCKET_BAD || writefd != ARES_SOCKET_BAD) {
++      process(readfd, writefd);
++    }
++  }
+ }
+ 
+ #ifdef HAVE_LIBCARES
+ 
+-int AsyncNameResolver::getsock(sock_t* sockets) const
++const std::vector<AsyncNameResolverSocketEntry>&
++AsyncNameResolver::getsock() const
+ {
+-  return ares_getsock(channel_, reinterpret_cast<ares_socket_t*>(sockets),
+-                      ARES_GETSOCK_MAXNUM);
++  return socks_;
+ }
+ 
+ void AsyncNameResolver::process(ares_socket_t readfd, ares_socket_t writefd)
+@@ -125,41 +201,4 @@
+   return this == &resolver;
+ }
+ 
+-void AsyncNameResolver::reset()
+-{
+-  hostname_ = A2STR::NIL;
+-  resolvedAddresses_.clear();
+-  status_ = STATUS_READY;
+-  ares_destroy(channel_);
+-  // TODO evaluate return value
+-  ares_init(&channel_);
+-}
+-
+-#ifdef HAVE_ARES_ADDR_NODE
+-
+-ares_addr_node* parseAsyncDNSServers(const std::string& serversOpt)
+-{
+-  std::vector<std::string> servers;
+-  util::split(std::begin(serversOpt), std::end(serversOpt),
+-              std::back_inserter(servers), ',', true /* doStrip */);
+-  ares_addr_node root;
+-  root.next = nullptr;
+-  ares_addr_node* tail = &root;
+-  for (const auto& s : servers) {
+-    auto node = make_unique<ares_addr_node>();
+-
+-    size_t len = net::getBinAddr(&node->addr, s.c_str());
+-    if (len != 0) {
+-      node->next = nullptr;
+-      node->family = (len == 4 ? AF_INET : AF_INET6);
+-      tail->next = node.release();
+-      tail = tail->next;
+-    }
+-  }
+-
+-  return root.next;
+-}
+-
+-#endif // HAVE_ARES_ADDR_NODE
+-
+ } // namespace aria2
+--- a/src/AsyncNameResolver.h
++++ b/src/AsyncNameResolver.h
+@@ -46,9 +46,14 @@
+ 
+ namespace aria2 {
+ 
++struct AsyncNameResolverSocketEntry {
++  ares_socket_t fd;
++  int events;
++};
++
+ class AsyncNameResolver {
+   friend void callback(void* arg, int status, int timeouts,
+-                       struct hostent* host);
++                       ares_addrinfo* result);
+ 
+ public:
+   enum STATUS {
+@@ -59,6 +64,7 @@
+   };
+ 
+ private:
++  std::vector<AsyncNameResolverSocketEntry> socks_;
+   STATUS status_;
+   int family_;
+   ares_channel channel_;
+@@ -68,12 +74,7 @@
+   std::string hostname_;
+ 
+ public:
+-  AsyncNameResolver(int family
+-#ifdef HAVE_ARES_ADDR_NODE
+-                    ,
+-                    ares_addr_node* servers
+-#endif // HAVE_ARES_ADDR_NODE
+-  );
++  AsyncNameResolver(int family, const std::string& servers);
+ 
+   ~AsyncNameResolver();
+ 
+@@ -88,14 +89,14 @@
+ 
+   STATUS getStatus() const { return status_; }
+ 
+-  int getFds(fd_set* rfdsPtr, fd_set* wfdsPtr) const;
++  ares_socket_t getFds(fd_set* rfdsPtr, fd_set* wfdsPtr) const;
+ 
+   void process(fd_set* rfdsPtr, fd_set* wfdsPtr);
+ 
+   int getFamily() const { return family_; }
+ #ifdef HAVE_LIBCARES
+ 
+-  int getsock(sock_t* sockets) const;
++  const std::vector<AsyncNameResolverSocketEntry>& getsock() const;
+ 
+   void process(ares_socket_t readfd, ares_socket_t writefd);
+ 
+@@ -105,16 +106,10 @@
+ 
+   void setAddr(const std::string& addrString);
+ 
+-  void reset();
+-
+   const std::string& getHostname() const { return hostname_; }
+-};
+ 
+-#ifdef HAVE_ARES_ADDR_NODE
+-
+-ares_addr_node* parseAsyncDNSServers(const std::string& serversOpt);
+-
+-#endif // HAVE_ARES_ADDR_NODE
++  void handle_sock_state(ares_socket_t sock, int read, int write);
++};
+ 
+ } // namespace aria2
+ 
+--- a/src/AsyncNameResolverMan.cc
++++ b/src/AsyncNameResolverMan.cc
+@@ -88,12 +88,7 @@
+                                             Command* command)
+ {
+   asyncNameResolver_[numResolver_] =
+-      std::make_shared<AsyncNameResolver>(family
+-#ifdef HAVE_ARES_ADDR_NODE
+-                                          ,
+-                                          e->getAsyncDNSServers()
+-#endif // HAVE_ARES_ADDR_NODE
+-      );
++      std::make_shared<AsyncNameResolver>(family, servers_);
+   asyncNameResolver_[numResolver_]->resolve(hostname);
+   setNameResolverCheck(numResolver_, e, command);
+ }
+@@ -222,6 +217,7 @@
+   if (!net::getIPv6AddrConfigured() || option->getAsBool(PREF_DISABLE_IPV6)) {
+     asyncNameResolverMan->setIPv6(false);
+   }
++  asyncNameResolverMan->setServers(option->get(PREF_ASYNC_DNS_SERVER));
+ }
+ 
+ } // namespace aria2
+--- a/src/AsyncNameResolverMan.h
++++ b/src/AsyncNameResolverMan.h
+@@ -79,6 +79,8 @@
+   // Resets state. Also removes resolvers from DownloadEngine.
+   void reset(DownloadEngine* e, Command* command);
+ 
++  void setServers(std::string servers) { servers_ = std::move(servers); }
++
+ private:
+   void startAsyncFamily(const std::string& hostname, int family,
+                         DownloadEngine* e, Command* command);
+@@ -88,6 +90,7 @@
+                                 Command* command);
+ 
+   std::shared_ptr<AsyncNameResolver> asyncNameResolver_[2];
++  std::string servers_;
+   size_t numResolver_;
+   int resolverCheck_;
+   bool ipv4_;
+--- a/src/DownloadEngine.cc
++++ b/src/DownloadEngine.cc
+@@ -104,9 +104,6 @@
+ #ifdef ENABLE_BITTORRENT
+       btRegistry_(make_unique<BtRegistry>()),
+ #endif // ENABLE_BITTORRENT
+-#ifdef HAVE_ARES_ADDR_NODE
+-      asyncDNSServers_(nullptr),
+-#endif // HAVE_ARES_ADDR_NODE
+       dnsCache_(make_unique<DNSCache>()),
+       option_(nullptr)
+ {
+@@ -115,12 +112,7 @@
+   sessionId_.assign(&sessionId[0], &sessionId[sizeof(sessionId)]);
+ }
+ 
+-DownloadEngine::~DownloadEngine()
+-{
+-#ifdef HAVE_ARES_ADDR_NODE
+-  setAsyncDNSServers(nullptr);
+-#endif // HAVE_ARES_ADDR_NODE
+-}
++DownloadEngine::~DownloadEngine() {}
+ 
+ namespace {
+ void executeCommand(std::deque<std::unique_ptr<Command>>& commands,
+@@ -612,19 +604,6 @@
+   checkIntegrityMan_ = std::move(ciman);
+ }
+ 
+-#ifdef HAVE_ARES_ADDR_NODE
+-void DownloadEngine::setAsyncDNSServers(ares_addr_node* asyncDNSServers)
+-{
+-  ares_addr_node* node = asyncDNSServers_;
+-  while (node) {
+-    ares_addr_node* next = node->next;
+-    delete node;
+-    node = next;
+-  }
+-  asyncDNSServers_ = asyncDNSServers;
+-}
+-#endif // HAVE_ARES_ADDR_NODE
+-
+ #ifdef ENABLE_WEBSOCKET
+ void DownloadEngine::setWebSocketSessionMan(
+     std::unique_ptr<rpc::WebSocketSessionMan> wsman)
+--- a/src/DownloadEngine.h
++++ b/src/DownloadEngine.h
+@@ -137,10 +137,6 @@
+ 
+   CUIDCounter cuidCounter_;
+ 
+-#ifdef HAVE_ARES_ADDR_NODE
+-  ares_addr_node* asyncDNSServers_;
+-#endif // HAVE_ARES_ADDR_NODE
+-
+   std::unique_ptr<DNSCache> dnsCache_;
+ 
+   std::unique_ptr<AuthConfigFactory> authConfigFactory_;
+@@ -326,12 +322,6 @@
+ 
+   const std::string getSessionId() const { return sessionId_; }
+ 
+-#ifdef HAVE_ARES_ADDR_NODE
+-  void setAsyncDNSServers(ares_addr_node* asyncDNSServers);
+-
+-  ares_addr_node* getAsyncDNSServers() const { return asyncDNSServers_; }
+-#endif // HAVE_ARES_ADDR_NODE
+-
+ #ifdef ENABLE_WEBSOCKET
+   void setWebSocketSessionMan(std::unique_ptr<rpc::WebSocketSessionMan> wsman);
+   const std::unique_ptr<rpc::WebSocketSessionMan>&
+--- a/src/Event.h
++++ b/src/Event.h
+@@ -293,16 +293,12 @@
+ 
+   Command* command_;
+ 
+-  size_t socketsSize_;
+-
+-  sock_t sockets_[ARES_GETSOCK_MAXNUM];
++  std::vector<sock_t> sockets_;
+ 
+ public:
+   AsyncNameResolverEntry(std::shared_ptr<AsyncNameResolver> nameResolver,
+                          Command* command)
+-      : nameResolver_(std::move(nameResolver)),
+-        command_(command),
+-        socketsSize_(0)
++      : nameResolver_(std::move(nameResolver)), command_(command)
+   {
+   }
+ 
+@@ -323,33 +319,27 @@
+ 
+   void addSocketEvents(EventPoll* e)
+   {
+-    socketsSize_ = 0;
+-    int mask = nameResolver_->getsock(sockets_);
+-    if (mask == 0) {
+-      return;
+-    }
+-    size_t i;
+-    for (i = 0; i < ARES_GETSOCK_MAXNUM; ++i) {
++    const auto& socks = nameResolver_->getsock();
++    sockets_.resize(socks.size());
++    auto sock_it = std::begin(sockets_);
++
++    for (const auto& ent : socks) {
+       int events = 0;
+-      if (ARES_GETSOCK_READABLE(mask, i)) {
++      if (ent.events & EventPoll::EVENT_READ) {
+         events |= EventPoll::IEV_READ;
+       }
+-      if (ARES_GETSOCK_WRITABLE(mask, i)) {
++      if (ent.events & EventPoll::EVENT_WRITE) {
+         events |= EventPoll::IEV_WRITE;
+       }
+-      if (events == 0) {
+-        // assume no further sockets are returned.
+-        break;
+-      }
+-      e->addEvents(sockets_[i], command_, events, nameResolver_);
++      e->addEvents(ent.fd, command_, events, nameResolver_);
++      *sock_it++ = ent.fd;
+     }
+-    socketsSize_ = i;
+   }
+ 
+   void removeSocketEvents(EventPoll* e)
+   {
+-    for (size_t i = 0; i < socketsSize_; ++i) {
+-      e->deleteEvents(sockets_[i], command_, nameResolver_);
++    for (auto fd : sockets_) {
++      e->deleteEvents(fd, command_, nameResolver_);
+     }
+   }
+ 
+--- a/src/MultiUrlRequestInfo.cc
++++ b/src/MultiUrlRequestInfo.cc
+@@ -272,11 +272,6 @@
+     clTlsContext->setVerifyPeer(option_->getAsBool(PREF_CHECK_CERTIFICATE));
+     SocketCore::setClientTLSContext(clTlsContext);
+ #endif
+-#ifdef HAVE_ARES_ADDR_NODE
+-    ares_addr_node* asyncDNSServers =
+-        parseAsyncDNSServers(option_->get(PREF_ASYNC_DNS_SERVER));
+-    e_->setAsyncDNSServers(asyncDNSServers);
+-#endif // HAVE_ARES_ADDR_NODE
+ 
+     std::string serverStatIf = option_->get(PREF_SERVER_STAT_IF);
+     if (!serverStatIf.empty()) {
+--- a/src/OptionHandlerFactory.cc
++++ b/src/OptionHandlerFactory.cc
+@@ -99,15 +99,13 @@
+     op->setChangeOptionForReserved(true);
+     handlers.push_back(op);
+   }
+-#  if defined(HAVE_ARES_SET_SERVERS) && defined(HAVE_ARES_ADDR_NODE)
+   {
+     OptionHandler* op(new DefaultOptionHandler(
+         PREF_ASYNC_DNS_SERVER, TEXT_ASYNC_DNS_SERVER, NO_DEFAULT_VALUE));
+     op->addTag(TAG_ADVANCED);
+     handlers.push_back(op);
+   }
+-#  endif // HAVE_ARES_SET_SERVERS && HAVE_ARES_ADDR_NODE
+-#endif   // ENABLE_ASYNC_DNS
++#endif // ENABLE_ASYNC_DNS
+   {
+     OptionHandler* op(new BooleanOptionHandler(
+         PREF_AUTO_FILE_RENAMING, TEXT_AUTO_FILE_RENAMING, A2_V_TRUE,
+--- a/src/SelectEventPoll.cc
++++ b/src/SelectEventPoll.cc
+@@ -129,8 +129,8 @@
+ {
+ }
+ 
+-int SelectEventPoll::AsyncNameResolverEntry::getFds(fd_set* rfdsPtr,
+-                                                    fd_set* wfdsPtr)
++ares_socket_t SelectEventPoll::AsyncNameResolverEntry::getFds(fd_set* rfdsPtr,
++                                                              fd_set* wfdsPtr)
+ {
+   return nameResolver_->getFds(rfdsPtr, wfdsPtr);
+ }
+@@ -184,7 +184,7 @@
+ 
+   for (auto& i : nameResolverEntries_) {
+     auto& entry = i.second;
+-    int fd = entry.getFds(&rfds, &wfds);
++    auto fd = entry.getFds(&rfds, &wfds);
+     // TODO force error if fd == 0
+     if (fdmax_ < fd) {
+       fdmax_ = fd;
+--- a/src/SelectEventPoll.h
++++ b/src/SelectEventPoll.h
+@@ -142,7 +142,7 @@
+               command_ < entry.command_);
+     }
+ 
+-    int getFds(fd_set* rfdsPtr, fd_set* wfdsPtr);
++    ares_socket_t getFds(fd_set* rfdsPtr, fd_set* wfdsPtr);
+ 
+     void process(fd_set* rfdsPtr, fd_set* wfdsPtr);
+   };
+--- a/test/AsyncNameResolverTest.cc
++++ b/test/AsyncNameResolverTest.cc
+@@ -11,43 +11,14 @@
+ class AsyncNameResolverTest : public CppUnit::TestFixture {
+ 
+   CPPUNIT_TEST_SUITE(AsyncNameResolverTest);
+-  CPPUNIT_TEST(testParseAsyncDNSServers);
+   CPPUNIT_TEST_SUITE_END();
+ 
+ public:
+   void setUp() {}
+ 
+   void tearDown() {}
+-
+-  void testParseAsyncDNSServers();
+ };
+ 
+ CPPUNIT_TEST_SUITE_REGISTRATION(AsyncNameResolverTest);
+ 
+-void AsyncNameResolverTest::testParseAsyncDNSServers()
+-{
+-#ifdef HAVE_ARES_ADDR_NODE
+-  in_addr ans4;
+-  CPPUNIT_ASSERT_EQUAL((size_t)4, net::getBinAddr(&ans4, "192.168.0.1"));
+-  in6_addr ans6;
+-  CPPUNIT_ASSERT_EQUAL((size_t)16, net::getBinAddr(&ans6, "2001:db8::2:1"));
+-
+-  ares_addr_node* root;
+-  root = parseAsyncDNSServers("192.168.0.1,2001:db8::2:1");
+-  ares_addr_node* node = root;
+-  CPPUNIT_ASSERT(node);
+-  CPPUNIT_ASSERT_EQUAL(AF_INET, node->family);
+-  CPPUNIT_ASSERT(memcmp(&ans4, &node->addr, sizeof(ans4)) == 0);
+-  node = node->next;
+-  CPPUNIT_ASSERT(node);
+-  CPPUNIT_ASSERT_EQUAL(AF_INET6, node->family);
+-  CPPUNIT_ASSERT(memcmp(&ans6, &node->addr, sizeof(ans6)) == 0);
+-  for (node = root; node;) {
+-    ares_addr_node* nextNode = node->next;
+-    delete node;
+-    node = nextNode;
+-  }
+-#endif // HAVE_ARES_ADDR_NODE
+-}
+-
+ } // namespace aria2
